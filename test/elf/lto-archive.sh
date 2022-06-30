@@ -13,8 +13,6 @@ cd "$(dirname "$0")"/../..
 t=out/test/elf/$testname
 mkdir -p $t
 
-[ "$CC" = cc ] || { echo skipped; exit; }
-
 cat <<EOF | $CC -o $t/a.o -c -flto -xc -
 #include <stdio.h>
 void hello() {

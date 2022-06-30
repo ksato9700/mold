@@ -85,6 +85,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <regex>
 #include <sstream>
 #include <tbb/parallel_for_each.h>
 #include <unistd.h>
@@ -109,16 +110,33 @@ static std::vector<PluginSymbol> plugin_symbols;
 static ClaimFileHandler *claim_file_hook;
 static AllSymbolsReadHandler *all_symbols_read_hook;
 static CleanupHandler *cleanup_hook;
+static bool is_gcc_linker_api_v1 = false;
 
 // Event handlers
 
-static PluginStatus message(int level, const char *fmt, ...) {
+template <typename E>
+static PluginStatus message(PluginLevel level, const char *fmt, ...) {
   LOG << "message\n";
+  Context<E> &ctx = *gctx<E>;
+
+  char buf[1000];
   va_list ap;
   va_start(ap, fmt);
-  fprintf(stderr, "mold: ");
-  vfprintf(stderr, fmt, ap);
-  fprintf(stderr, "\n");
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  switch (level) {
+  case LDPL_INFO:
+    SyncOut(ctx) << buf;
+    break;
+  case LDPL_WARNING:
+    Warn(ctx) << buf;
+    break;
+  case LDPL_ERROR:
+  case LDPL_FATAL:
+    Fatal(ctx) << buf;
+  }
+
   return LDPS_OK;
 }
 
@@ -398,6 +416,30 @@ get_wrap_symbols(uint64_t *num_symbols, const char ***wrap_symbols) {
   return LDPS_OK;
 }
 
+// Returns MOLD_MAJOR_VERSION * 1000 + MOLD_MINOR_VERSION.
+static i64 get_mold_version() {
+  static std::regex re(R"(^([0-9]+)\.([0-9]+))", std::regex_constants::ECMAScript);
+  std::string verstr = MOLD_VERSION;
+  std::smatch m;
+  bool ok = std::regex_search(verstr, m, re);
+  assert(ok);
+  return std::stoi(m[0]) * 1000 + std::stoi(m[1]);
+}
+
+static PluginLinkerAPIVersion
+get_api_version(const char *plugin_identifier,
+                unsigned plugin_version,
+                PluginLinkerAPIVersion minimal_api_supported,
+                PluginLinkerAPIVersion maximal_api_supported,
+                const char **linker_identifier,
+                unsigned *linker_version) {
+  assert(maximal_api_supported >= LAPI_V1);
+  *linker_identifier = "mold";
+  *linker_version = get_mold_version();
+  is_gcc_linker_api_v1 = true;
+  return LAPI_V1;
+}
+
 template <typename E>
 static void load_plugin(Context<E> &ctx) {
   assert(phase == 0);
@@ -418,7 +460,7 @@ static void load_plugin(Context<E> &ctx) {
   };
 
   std::vector<PluginTagValue> tv;
-  tv.emplace_back(LDPT_MESSAGE, message);
+  tv.emplace_back(LDPT_MESSAGE, message<E>);
 
   if (ctx.arg.shared)
     tv.emplace_back(LDPT_LINKER_OUTPUT, LDPO_DYN);
@@ -449,6 +491,7 @@ static void load_plugin(Context<E> &ctx) {
   tv.emplace_back(LDPT_GET_INPUT_SECTION_CONTENTS, get_input_section_contents);
   tv.emplace_back(LDPT_UPDATE_SECTION_ORDER, update_section_order);
   tv.emplace_back(LDPT_ALLOW_SECTION_ORDERING, allow_section_ordering);
+  tv.emplace_back(LDPT_ADD_SYMBOLS_V2, add_symbols);
   tv.emplace_back(LDPT_GET_SYMBOLS_V2, get_symbols_v2<E>);
   tv.emplace_back(LDPT_ALLOW_UNIQUE_SEGMENT_FOR_SECTIONS,
                   allow_unique_segment_for_sections);
@@ -458,9 +501,11 @@ static void load_plugin(Context<E> &ctx) {
   tv.emplace_back(LDPT_GET_INPUT_SECTION_SIZE, get_input_section_size);
   tv.emplace_back(LDPT_REGISTER_NEW_INPUT_HOOK, register_new_input_hook<E>);
   tv.emplace_back(LDPT_GET_WRAP_SYMBOLS, get_wrap_symbols);
+  tv.emplace_back(LDPT_GET_API_VERSION, get_api_version);
   tv.emplace_back(LDPT_NULL, 0);
 
-  onload(tv.data());
+  PluginStatus status = onload(tv.data());
+  assert(status == LDPS_OK);
 }
 
 template <typename E>
@@ -524,10 +569,10 @@ static bool is_llvm(Context<E> &ctx) {
 }
 
 // Returns true if a given linker plugin supports the get_symbols_v3 API.
-// Currently, we simply assume that LLVM supports it and GCC does not.
+// Any version of LLVM and GCC 12 or newer support it.
 template <typename E>
 static bool suppots_v3_api(Context<E> &ctx) {
-  return is_llvm(ctx);
+  return is_gcc_linker_api_v1 || is_llvm(ctx);
 }
 
 template <typename E>
